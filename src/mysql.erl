@@ -919,7 +919,7 @@ kill_query(#state{connection_id = ConnId, host = Host, port = Port,
 
 stop_server(Reason,
             #state{socket = Socket, connection_id = ConnId} = State) ->
-  error_logger:error_msg("Connection Id ~p closing with reason: ~p~n",
+  error_logger:info_msg("Connection Id ~p closing with reason: ~p~n",
                          [ConnId, Reason]),
   ok = gen_tcp:close(Socket),
   {stop, Reason, State#state{socket = undefined, connection_id = undefined}}.
