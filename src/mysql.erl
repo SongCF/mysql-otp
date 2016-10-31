@@ -455,7 +455,8 @@ encode(Conn, Term) ->
                 query_timeout, query_cache_time,
                 affected_rows = 0, status = 0, warning_count = 0, insert_id = 0,
                 transaction_level = 0, ping_ref = undefined,
-                stmts = dict:new(), query_cache = empty}).
+                stmts = dict:new(), query_cache = empty,
+                tcp_closed = false}).
 
 %% @private
 init(Opts) ->
@@ -757,8 +758,11 @@ handle_info(_Info, State) ->
     {noreply, State}.
 
 %% @private
+terminate(Reason, #state{tcp_closed = TcpClosed})
+    when Reason == normal andalso TcpClosed =:= true ->
+    ok;
 terminate(Reason, #state{socket = Socket})
-  when Reason == normal; Reason == shutdown ->
+    when Reason == normal; Reason == shutdown ->
       %% Send the goodbye message for politeness.
       inet:setopts(Socket, [{active, false}]),
       R = mysql_protocol:quit(gen_tcp, Socket),
@@ -919,7 +923,12 @@ kill_query(#state{connection_id = ConnId, host = Host, port = Port,
 
 stop_server(Reason,
             #state{socket = Socket, connection_id = ConnId} = State) ->
-  error_logger:info_msg("Connection Id ~p closing with reason: ~p~n",
+    error_logger:info_msg("Connection Id ~p closing with reason: ~p~n",
                          [ConnId, Reason]),
-  ok = gen_tcp:close(Socket),
-  {stop, Reason, State#state{socket = undefined, connection_id = undefined}}.
+    ok = gen_tcp:close(Socket),
+    case Reason of
+        tcp_closed ->
+            {stop, normal, State#state{socket = undefined, connection_id = undefined, tcp_closed = true}};
+        _ ->
+            {stop, Reason, State#state{socket = undefined, connection_id = undefined}}
+    end.
