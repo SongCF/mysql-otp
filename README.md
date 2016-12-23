@@ -1,3 +1,19 @@
+CHANGELOG
+=========
+mysql-server的连接长时间空闲后会断开连接(默认8小时)，此时mysql-otp会打出各种error log,这些错误日志我们并不需要，所以在这里稍作修改，把它去掉了。我们是直接使用的mysql_poolboy项目(该项目也需要稍作修改去掉重连的错误日志)
+
+##### 我为什么选择mysql-otp:
+`erlang-mysql-driver VS emysql VS mysql-otp`, 这三者我们比较了一下
+- `erlang-mysql-driver`的连接池就是一个数组循环利用，不是真正的连接池，当出现大量连续请求时，很容易照成部分连接空闲，而部分连接有多条请求等待处理。
+- `emysql`与`erlang-mysql-driver`相比拥有真正的连接池，但是无transaction，后来我们自己添加了transaction，用了一段时间后，有一次发现连接长时间闲置后自动断开不会重连，然后导致各种错误；后来发现了`mysql-otp`我们就舍弃了它
+- `mysql-otp` 断连后自动重连，有transaction，配合poolboy使用，我们直接用的mysql_poolboy这个项目
+
+
+---
+原项目地址：https://github.com/mysql-otp/mysql-otp
+
+---
+
 MySQL/OTP
 =========
 
