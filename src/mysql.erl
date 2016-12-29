@@ -36,6 +36,7 @@
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2,
          code_change/3]).
 
+-define(RECONNECT_TIME, 60000).
 -define(default_host, "localhost").
 -define(default_port, 3306).
 -define(default_user, <<>>).
@@ -449,64 +450,48 @@ encode(Conn, Term) ->
 -include("server_status.hrl").
 
 %% Gen_server state
--record(state, {server_version, connection_id, socket,
+-record(state, {opt, server_version, connection_id, socket,
                 host, port, user, password, log_warnings,
                 ping_timeout,
                 query_timeout, query_cache_time,
                 affected_rows = 0, status = 0, warning_count = 0, insert_id = 0,
                 transaction_level = 0, ping_ref = undefined,
-                stmts = dict:new(), query_cache = empty,
-                tcp_closed = false}).
+                stmts = dict:new(), query_cache = empty}).
 
 %% @private
 init(Opts) ->
-    %% Connect
-    Host           = proplists:get_value(host, Opts, ?default_host),
-    Port           = proplists:get_value(port, Opts, ?default_port),
-    User           = proplists:get_value(user, Opts, ?default_user),
-    Password       = proplists:get_value(password, Opts, ?default_password),
-    Database       = proplists:get_value(database, Opts, undefined),
-    LogWarn        = proplists:get_value(log_warnings, Opts, true),
-    KeepAlive      = proplists:get_value(keep_alive, Opts, false),
-    Timeout        = proplists:get_value(query_timeout, Opts,
-                                         ?default_query_timeout),
-    QueryCacheTime = proplists:get_value(query_cache_time, Opts,
-                                         ?default_query_cache_time),
-    TcpOpts        = proplists:get_value(tcp_options, Opts, []),
-
-    PingTimeout = case KeepAlive of
-        true         -> ?default_ping_timeout;
-        false        -> infinity;
-        N when N > 0 -> N
-    end,
-
-    %% Connect socket
-    SockOpts = [binary, {packet, raw} | TcpOpts],
-    {ok, Socket} = gen_tcp:connect(Host, Port, SockOpts),
-
-    %% Exchange handshake communication.
-    inet:setopts(Socket, [{active, false}]),
-    Result = mysql_protocol:handshake(User, Password, Database, gen_tcp,
-                                      Socket),
-    inet:setopts(Socket, [{active, once}]),
-    case Result of
-        #handshake{server_version = Version, connection_id = ConnId,
-                   status = Status} ->
-            State = #state{server_version = Version, connection_id = ConnId,
-                           socket = Socket,
-                           host = Host, port = Port, user = User,
-                           password = Password, status = Status,
-                           log_warnings = LogWarn,
-                           ping_timeout = PingTimeout,
-                           query_timeout = Timeout,
-                           query_cache_time = QueryCacheTime},
-            %% Trap exit so that we can properly disconnect when we die.
-            process_flag(trap_exit, true),
-            State1 = schedule_ping(State),
+    case connect(Opts) of
+        {ok, State1}->
             {ok, State1};
-        #error{} = E ->
-            {stop, error_to_reason(E)}
+        Err ->
+            {stop, Err}
     end.
+
+
+handle_call(_Msg, _From, #state{socket = undefined}=State) ->
+    {reply, {error, "mysql_disconnect"}, State};
+handle_call(Msg, From, State) ->
+    do_call(Msg, From, State).
+
+
+handle_cast(_Msg, State) ->
+    {noreply, State}.
+
+
+handle_info(reconnect, #state{opt = Opts}=State) ->
+    %% 2.隔段时间重连
+    case connect(Opts) of
+        {ok, State1}->
+            {noreply, State1};
+        Err ->
+            error_logger:error_msg("~p(line ~p) mysql reconnect error = ~p", [?FILE,?LINE, Err]),
+            erlang:send_after(?RECONNECT_TIME, self(), reconnect),
+            {noreply, State#state{socket=undefined, connection_id=undefined, ping_ref=undefined}}
+    end;
+handle_info(_Msg, #state{socket = undefined}=State) ->
+    {noreply, State};
+handle_info(Msg, State)->
+    do_info(Msg, State).
 
 %% @private
 %% @doc
@@ -553,9 +538,9 @@ init(Opts) ->
 %%       able to handle this in the caller's process, we also return the
 %%       nesting level.</dd>
 %% </dl>
-handle_call({query, Query}, From, State) ->
-    handle_call({query, Query, State#state.query_timeout}, From, State);
-handle_call({query, Query, Timeout}, _From, State) ->
+do_call({query, Query}, From, State) ->
+    do_call({query, Query, State#state.query_timeout}, From, State);
+do_call({query, Query, Timeout}, _From, State) ->
     Socket = State#state.socket,
     inet:setopts(Socket, [{active, false}]),
     {ok, Recs} = case mysql_protocol:query(Query, gen_tcp, Socket, Timeout) of
@@ -574,10 +559,10 @@ handle_call({query, Query, Timeout}, _From, State) ->
     State1#state.warning_count > 0 andalso State1#state.log_warnings
         andalso log_warnings(State1, Query),
     handle_query_call_reply(Recs, Query, State1, []);
-handle_call({param_query, Query, Params}, From, State) ->
-    handle_call({param_query, Query, Params, State#state.query_timeout}, From,
+do_call({param_query, Query, Params}, From, State) ->
+    do_call({param_query, Query, Params, State#state.query_timeout}, From,
                 State);
-handle_call({param_query, Query, Params, Timeout}, _From, State) ->
+do_call({param_query, Query, Params, Timeout}, _From, State) ->
     %% Parametrized query: Prepared statement cached with the query as the key
     QueryBin = iolist_to_binary(Query),
     #state{socket = Socket} = State,
@@ -611,16 +596,16 @@ handle_call({param_query, Query, Params, Timeout}, _From, State) ->
         PrepareError ->
             {reply, PrepareError, State}
     end;
-handle_call({execute, Stmt, Args}, From, State) ->
-    handle_call({execute, Stmt, Args, State#state.query_timeout}, From, State);
-handle_call({execute, Stmt, Args, Timeout}, _From, State) ->
+do_call({execute, Stmt, Args}, From, State) ->
+    do_call({execute, Stmt, Args, State#state.query_timeout}, From, State);
+do_call({execute, Stmt, Args, Timeout}, _From, State) ->
     case dict:find(Stmt, State#state.stmts) of
         {ok, StmtRec} ->
             execute_stmt(StmtRec, Args, Timeout, State);
         error ->
             {reply, {error, not_prepared}, State}
     end;
-handle_call({prepare, Query}, _From, State) ->
+do_call({prepare, Query}, _From, State) ->
     #state{socket = Socket} = State,
     inet:setopts(Socket, [{active, false}]),
     Rec = mysql_protocol:prepare(Query, gen_tcp, Socket),
@@ -634,7 +619,7 @@ handle_call({prepare, Query}, _From, State) ->
             State2 = State#state{stmts = Stmts1},
             {reply, {ok, Id}, State2}
     end;
-handle_call({prepare, Name, Query}, _From, State) when is_atom(Name) ->
+do_call({prepare, Name, Query}, _From, State) when is_atom(Name) ->
     #state{socket = Socket} = State,
     %% First unprepare if there is an old statement with this name.
     inet:setopts(Socket, [{active, false}]),
@@ -656,7 +641,7 @@ handle_call({prepare, Name, Query}, _From, State) when is_atom(Name) ->
             State3 = State2#state{stmts = Stmts1},
             {reply, {ok, Name}, State3}
     end;
-handle_call({unprepare, Stmt}, _From, State) when is_atom(Stmt);
+do_call({unprepare, Stmt}, _From, State) when is_atom(Stmt);
                                                   is_integer(Stmt) ->
     case dict:find(Stmt, State#state.stmts) of
         {ok, StmtRec} ->
@@ -670,19 +655,19 @@ handle_call({unprepare, Stmt}, _From, State) when is_atom(Stmt);
         error ->
             {reply, {error, not_prepared}, State}
     end;
-handle_call(warning_count, _From, State) ->
+do_call(warning_count, _From, State) ->
     {reply, State#state.warning_count, State};
-handle_call(insert_id, _From, State) ->
+do_call(insert_id, _From, State) ->
     {reply, State#state.insert_id, State};
-handle_call(affected_rows, _From, State) ->
+do_call(affected_rows, _From, State) ->
     {reply, State#state.affected_rows, State};
-handle_call(autocommit, _From, State) ->
+do_call(autocommit, _From, State) ->
     {reply, State#state.status band ?SERVER_STATUS_AUTOCOMMIT /= 0, State};
-handle_call(backslash_escapes_enabled, _From, State = #state{status = S}) ->
+do_call(backslash_escapes_enabled, _From, State = #state{status = S}) ->
     {reply, S band ?SERVER_STATUS_NO_BACKSLASH_ESCAPES == 0, State};
-handle_call(in_transaction, _From, State) ->
+do_call(in_transaction, _From, State) ->
     {reply, State#state.status band ?SERVER_STATUS_IN_TRANS /= 0, State};
-handle_call(start_transaction, _From,
+do_call(start_transaction, _From,
             State = #state{socket = Socket, transaction_level = L,
                            status = Status})
   when Status band ?SERVER_STATUS_IN_TRANS == 0, L == 0;
@@ -697,7 +682,7 @@ handle_call(start_transaction, _From,
     inet:setopts(Socket, [{active, once}]),
     State1 = update_state(Res, State),
     {reply, ok, State1#state{transaction_level = L + 1}};
-handle_call(rollback, _From, State = #state{socket = Socket, status = Status,
+do_call(rollback, _From, State = #state{socket = Socket, status = Status,
                                             transaction_level = L})
   when Status band ?SERVER_STATUS_IN_TRANS /= 0, L >= 1 ->
     Query = case L of
@@ -710,7 +695,7 @@ handle_call(rollback, _From, State = #state{socket = Socket, status = Status,
     inet:setopts(Socket, [{active, once}]),
     State1 = update_state(Res, State),
     {reply, ok, State1#state{transaction_level = L - 1}};
-handle_call(commit, _From, State = #state{socket = Socket, status = Status,
+do_call(commit, _From, State = #state{socket = Socket, status = Status,
                                           transaction_level = L})
   when Status band ?SERVER_STATUS_IN_TRANS /= 0, L >= 1 ->
     Query = case L of
@@ -724,12 +709,10 @@ handle_call(commit, _From, State = #state{socket = Socket, status = Status,
     State1 = update_state(Res, State),
     {reply, ok, State1#state{transaction_level = L - 1}}.
 
-%% @private
-handle_cast(_Msg, State) ->
-    {noreply, State}.
+
 
 %% @private
-handle_info(query_cache, #state{query_cache = Cache,
+do_info(query_cache, #state{query_cache = Cache,
                                 query_cache_time = CacheTime} = State) ->
     %% Evict expired queries/statements in the cache used by query/3.
     {Evicted, Cache1} = mysql_cache:evict_older_than(Cache, CacheTime),
@@ -745,24 +728,27 @@ handle_info(query_cache, #state{query_cache = Cache,
     mysql_cache:size(Cache1) > 0 andalso
         erlang:send_after(CacheTime, self(), query_cache),
     {noreply, State#state{query_cache = Cache1}};
-handle_info(ping, #state{socket = Socket} = State) ->
+do_info(ping, #state{socket = Socket} = State) ->
     inet:setopts(Socket, [{active, false}]),
     Ok = mysql_protocol:ping(gen_tcp, Socket),
     inet:setopts(Socket, [{active, once}]),
     {noreply, update_state(Ok, State)};
-handle_info({tcp_closed, _Socket}, State) ->
-    stop_server(tcp_closed, State);
-handle_info({tcp_error, _Socket, Reason}, State) ->
+do_info({tcp_closed, _Socket}, #state{socket=Socket, ping_ref=PingRef}=State) ->
+    %stop_server(tcp_closed, State);
+    %% 断连，可能是mysql空闲连接超时，或mysqld关闭了
+    %% 1.清理
+    Socket=/=undefined andalso gen_tcp:close(Socket),
+    is_reference(PingRef) andalso erlang:cancel_timer(PingRef),
+    %% 2.隔段时间重连
+    handle_info(reconnect, State);
+do_info({tcp_error, _Socket, Reason}, State) ->
     stop_server({tcp_error, Reason}, State);
-handle_info(_Info, State) ->
+do_info(_Info, State) ->
     {noreply, State}.
 
 %% @private
-terminate(Reason, #state{tcp_closed = TcpClosed})
-    when Reason == normal andalso TcpClosed =:= true ->
-    ok;
 terminate(Reason, #state{socket = Socket})
-    when Reason == normal; Reason == shutdown ->
+  when Reason == normal; Reason == shutdown ->
       %% Send the goodbye message for politeness.
       inet:setopts(Socket, [{active, false}]),
       R = mysql_protocol:quit(gen_tcp, Socket),
@@ -923,12 +909,60 @@ kill_query(#state{connection_id = ConnId, host = Host, port = Port,
 
 stop_server(Reason,
             #state{socket = Socket, connection_id = ConnId} = State) ->
-    error_logger:info_msg("Connection Id ~p closing with reason: ~p~n",
+  error_logger:info_msg("Connection Id ~p closing with reason: ~p~n",
                          [ConnId, Reason]),
-    ok = gen_tcp:close(Socket),
-    case Reason of
-        tcp_closed ->
-            {stop, normal, State#state{socket = undefined, connection_id = undefined, tcp_closed = true}};
+  ok = gen_tcp:close(Socket),
+  {stop, Reason, State#state{socket = undefined, connection_id = undefined}}.
+
+
+connect(Opts)->
+    %% Connect
+    Host           = proplists:get_value(host, Opts, ?default_host),
+    Port           = proplists:get_value(port, Opts, ?default_port),
+    User           = proplists:get_value(user, Opts, ?default_user),
+    Password       = proplists:get_value(password, Opts, ?default_password),
+    Database       = proplists:get_value(database, Opts, undefined),
+    LogWarn        = proplists:get_value(log_warnings, Opts, true),
+    KeepAlive      = proplists:get_value(keep_alive, Opts, false),
+    Timeout        = proplists:get_value(query_timeout, Opts,
+        ?default_query_timeout),
+    QueryCacheTime = proplists:get_value(query_cache_time, Opts,
+        ?default_query_cache_time),
+    TcpOpts        = proplists:get_value(tcp_options, Opts, []),
+
+    PingTimeout = case KeepAlive of
+                      true         -> ?default_ping_timeout;
+                      false        -> infinity;
+                      N when N > 0 -> N
+                  end,
+
+    %% Connect socket
+    SockOpts = [binary, {packet, raw} | TcpOpts],
+    case gen_tcp:connect(Host, Port, SockOpts) of
+        {ok, Socket}->
+            %% Exchange handshake communication.
+            inet:setopts(Socket, [{active, false}]),
+            Result = mysql_protocol:handshake(User, Password, Database, gen_tcp, Socket),
+            inet:setopts(Socket, [{active, once}]),
+            case Result of
+                #handshake{server_version = Version, connection_id = ConnId,
+                    status = Status} ->
+                    State = #state{opt = Opts,
+                        server_version = Version, connection_id = ConnId,
+                        socket = Socket,
+                        host = Host, port = Port, user = User,
+                        password = Password, status = Status,
+                        log_warnings = LogWarn,
+                        ping_timeout = PingTimeout,
+                        query_timeout = Timeout,
+                        query_cache_time = QueryCacheTime},
+                    %% Trap exit so that we can properly disconnect when we die.
+                    process_flag(trap_exit, true),
+                    State1 = schedule_ping(State),
+                    {ok, State1};
+                #error{} = E ->
+                    {error, error_to_reason(E)}
+            end;
         _ ->
-            {stop, Reason, State#state{socket = undefined, connection_id = undefined}}
+            {error, <<"tcp connect failed">>}
     end.

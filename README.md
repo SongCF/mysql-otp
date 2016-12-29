@@ -1,6 +1,11 @@
 CHANGELOG
 =========
+
+##### 1.删除mysqld空闲连接超时断开的错误日志
 mysql-server的连接长时间空闲后会断开连接(默认8小时)，此时mysql-otp会打出各种error log,这些错误日志我们并不需要，所以在这里稍作修改，把它去掉了。我们是直接使用的mysql_poolboy项目(该项目也需要稍作修改去掉重连的错误日志)
+
+##### 2.修改mysqld挂了之后的处理
+mysql-server挂了之后，mysql_poolboy_sup会不停的重启`mysql(gen_server)`，达到上限后supervisor也会退出，或者导致整个应用都退出。此次主要修改`mysql.erl`文件，使mysql-server挂了之后，`mysql(gen_server)`不会退出，而是每隔一段时间尝试连接mysql-server。
 
 ##### 我为什么选择mysql-otp:
 `erlang-mysql-driver VS emysql VS mysql-otp`, 这三者我们比较了一下
